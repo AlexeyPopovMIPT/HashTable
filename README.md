@@ -197,5 +197,111 @@ TableElement():
   tail(nullptr)
 {}
 ```
-Так как они просто зануляют поля элементов массива `table`, можно, опять же, удалить эти конструкторы, перенеся содержимое `ListElement()` явно в 
+Так как они просто зануляют поля элементов массива `table`, можно, попробовать удалить эти конструкторы, перенеся содержимое `ListElement()` явно в 
 `ChainElement()`, и использовать `memset(table, 0, (hashMaxValue + 1)*sizeof(*table))` вместо них.
+Однако, как оказывается, `memset` исполняется даже дольше:
+![image](Images/Профилирование-6.png)
+Поэтому откажемся от этой идеи.
+Значительную часть времени исполнения программы составляет `Polimomial` - функция подсчёта хеша:
+```cpp
+    hash_t Polinomial(const char* str)
+    {
+        const hash_t A = (hash_t)2999;
+        hash_t ret = 0;
+        int idx = 0;
+        while (str[idx])
+            ret = A * ret + str[idx++];
+        return ret;
+    }
+```
+Её можно оптммизировать двумя способами:
+- Использовать SSE-инструкции
+```cpp
+unsigned short PolinomialSSE (const char* str)
+    {
+        if (sizeof(hash_t) != sizeof(unsigned short))
+        {
+            printf("Не буду считать\n");
+            return 0xDEAD;
+        }
+
+        unsigned short ret = *(str++), new_ret = 0;
+
+        if (ret == 0) return ret;
+
+        const __m128i factor = _mm_set_epi16(
+            (__uint16_t)(1), 
+            (__uint16_t)(2999), 
+            (__uint16_t)(2999*2999), 
+            (__uint16_t)(1203205223), 
+            (__uint16_t)(639935137), 
+            (__uint16_t)(-684905449), 
+            (__uint16_t)(-1037074063), 
+            (__uint16_t)(-628792633));
+        // Числа - short-степени 3189. Любое из этих чисел, что существенно, равно 0 при
+        // short-умножении на char, если и только если char == '\0'.
+
+        union
+        {   __m128i pack;
+            unsigned short arr [8];
+        } sample, mult; 
+
+
+        while (true)
+        {
+            
+            sample.pack = _mm_set_epi16(str[6], str[5], str[4], str[3], str[2], str[1], str[0], ret);
+            mult.pack = _mm_mullo_epi16(sample.pack, factor);
+
+            new_ret = mult.arr[0];
+
+            #define STEP(i)                                                              \
+                new_ret += mult.arr[i];                                                  \
+                if (mult.arr[i] == 0)                                                    \
+                {                                                                        \
+                    sample.pack = _mm_bslli_si128(sample.pack, 16 - 2*i);                \
+                    mult.pack = _mm_mullo_epi16(sample.pack, factor);                    \
+                    ret = 0;                                                             \
+                    for (int j = 8 - i; j < 8; j++)                                      \
+                        ret += mult.arr[j];                                              \
+                    return ret;                                                          \
+                }
+
+            STEP(1)
+            STEP(2)
+            STEP(3)
+            STEP(4)
+            STEP(5)
+            STEP(6)
+            STEP(7)
+
+            ret = new_ret;
+            str += 7;
+        }
+
+        printf("Why am I here?\n");
+        return 0xDEAD;
+    }
+```
+- переписать на ассемблере
+```
+global Polinomial_asm
+
+Polinomial_asm:
+
+    mov si, 3189
+    xor rax, rax
+    xor rcx, rcx
+    mov cl, [rdi]
+    jrcxz Return
+
+    Repeat:
+        add ax, cx
+        inc rdi
+        mov cl, [rdi]
+        jrcxz Return
+        mul si
+        jmp Repeat
+    Return:
+        ret
+```
